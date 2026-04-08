@@ -6,10 +6,10 @@ A consistent issue with Debian-based distros when using `unattended-upgrades` is
 
 ## What it does
 
-For every kernel "variant" installed on the system (e.g. `generic`, `rt`, `pve`, `lowlatency`), kernelkeeper keeps:
+Kernelkeeper scans your system for installed kernel packages and variants (e.g. `generic`, `rt`, `pve`, `lowlatency`). It then marks the ones it should keep:
 
-- The **currently running** kernel (`uname -r`), and
-- The **newest installed** kernel for that variant (the N-1 fallback)
+- The **currently running** kernel (`uname -r`)
+- The **newest installed** kernel for each variant
 
 Everything older is purged via `apt-get purge`. If a metapackage (e.g. `linux-image-generic`, `proxmox-default-kernel`) gets pulled out as a dependency during the purge, kernelkeeper detects this and reinstalls it automatically so future upgrades continue to work.
 
@@ -17,7 +17,14 @@ Everything older is purged via `apt-get purge`. If a metapackage (e.g. `linux-im
 
 Any Debian/Ubuntu-family system, including:
 
-- Debian, Devuan, Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary, Raspbian
+- Debian
+- Devuan
+- Ubuntu
+- Linux Mint
+- Pop!_OS
+- Zorin
+- elementary
+- Raspbian
 - Armbian
 - Proxmox VE (both PVE 7 with `pve-kernel-*` and PVE 8+ with `proxmox-kernel-*`, including signed variants and systems mid-migration where both naming schemes coexist)
 
@@ -65,8 +72,8 @@ This is especially useful on systems with a small `/boot` partition that can fai
 
 Proxmox VE changed its kernel package naming between major versions:
 
-| PVE version | Kernel packages              | Header packages               |
-|-------------|------------------------------|-------------------------------|
+| PVE version | Kernel packages            | Header packages             |
+|-------------|----------------------------|-----------------------------|
 | 7 and older | `pve-kernel-*`               | `pve-headers-*`               |
 | 8+          | `proxmox-kernel-*`           | `proxmox-headers-*`           |
 
