@@ -1,78 +1,232 @@
 #!/bin/bash
 #
-# kernelkeeper.sh
+# kernelkeeper
 #
-# Remove old kernels, keeping only the running kernel and the latest kernel
+# Remove old kernels, keeping the running kernel and the one prior (N-1).
+# Protects metapackages by reinstalling any that get inadvertently removed.
+# Supports Debian/Ubuntu-family distros including Proxmox VE and Armbian.
 #
-PID=$$
+# Proxmox package naming by version:
+#   PVE 7 and older: pve-kernel-*, pve-headers-*
+#   PVE 8+:          proxmox-kernel-*, proxmox-headers-*
+#   (both may coexist on systems upgraded from PVE 7 to PVE 8)
+#
+# Usage:
+#   kernelkeeper              # normal run
+#   kernelkeeper --dry-run    # show what would be removed, make no changes
+#   kernelkeeper --help       # this help text
+#
+# To hook into apt pre-install/upgrade, install to /usr/local/sbin and
+# create /etc/apt/apt.conf.d/99-kernelkeeper containing:
+#   Dpkg::Pre-Install-Pkgs {"/usr/local/sbin/kernelkeeper";};
+#
+
+set -euo pipefail
+
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+PID=$$
+TMPDIR_WORK="/tmp/kernelkeeper-$PID"
+DRY_RUN=false
 
-# root check
-if [ "$UID" != "0" ]
-then
-  echo "You must run this script as root."
-  exit 1
-fi
+# --- helpers ---
 
-# make sure it's ubuntu first
-UBUNTU="`which lsb_release > /dev/null && lsb_release -a 2>/dev/null | grep Ubuntu`"
-if [ "$UBUNTU" == "" ]
-then
-  echo "This script only works on Ubuntu and Ubuntu variants."
-  exit 1
-fi
+usage() {
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,1\}//'
+    exit 0
+}
 
-# store list of metapackages currently installed
-dpkg -l | grep \ linux | grep ii | awk '{print $2}' | grep -v [0-9] > /tmp/$PID.packagelist
+info()  { echo "[kernelkeeper] $*"; }
+warn()  { echo "[kernelkeeper] WARNING: $*" >&2; }
+die()   { echo "[kernelkeeper] ERROR: $*" >&2; exit 1; }
 
-# get current version
-CURRENT="`uname -r | cut -d- -f1,2`"
-REMOVE=""
+cleanup() {
+    rm -rf "$TMPDIR_WORK"
+}
+trap cleanup EXIT
 
-# scan for kernels
-for kernel in /boot/vmlinuz-*
-do
-  VERSION="`echo $kernel | cut -d- -f2,3`"
-  VARIANT="`echo $kernel | cut -d- -f4`"
-  # figure out what the latest version is
-  LATEST="`find /boot -name 'vmlinuz-*' | grep $VARIANT | cut -d- -f2,3 | sort | tail -n1`"
-  # if we're not using it and it's not new, plan to remove it
-  if [ "$VERSION" != "$CURRENT" ] && [ "$VERSION" != "$LATEST" ]
-  then
-    REMOVE="$REMOVE linux-image-$VERSION-$VARIANT"
-  fi
+# --- argument parsing ---
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --help|-h) usage ;;
+        *) die "Unknown argument: $arg" ;;
+    esac
 done
 
-# remove the packages
-if [ "x$REMOVE" != "x" ]
-then
-  echo "Current: $CURRENT"
-  apt-get remove -y $REMOVE
-  apt-get autoremove -y
+# --- preflight checks ---
+
+[[ "$EUID" -eq 0 ]] || die "This script must be run as root."
+
+command -v lsb_release &>/dev/null || die "lsb_release not found; cannot verify distro."
+DISTRO_ID=$(lsb_release -is 2>/dev/null)
+case "$DISTRO_ID" in
+    Ubuntu|Debian|Devuan|Armbian|LinuxMint|Pop|Raspbian|Zorin|elementary)
+        : ;;  # supported
+    *)
+        die "Unsupported distro: $DISTRO_ID. This script targets Debian/Ubuntu-family systems."
+        ;;
+esac
+
+mkdir -p "$TMPDIR_WORK"
+
+# --- snapshot metapackages ---
+# Save the set of installed linux/pve/proxmox meta-packages (those without a
+# version number in the name) so we can detect and restore any that get pulled
+# out as dependencies during removal.
+
+METAPKG_BEFORE="$TMPDIR_WORK/meta.before"
+dpkg-query -W -f='${Status} ${Package}\n' \
+        'linux-*' 'pve-kernel-*' 'pve-headers-*' \
+        'proxmox-kernel-*' 'proxmox-headers-*' \
+        'proxmox-default-kernel' 'proxmox-default-headers' \
+        2>/dev/null \
+    | awk '/^install ok installed/{print $4}' \
+    | grep -v '[0-9]' \
+    | sort > "$METAPKG_BEFORE"
+
+# --- determine kernels to remove ---
+
+CURRENT=$(uname -r)
+CURRENT_BASE=$(echo "$CURRENT" | cut -d- -f1,2)   # e.g. 6.8.0-57
+
+info "Running kernel: $CURRENT"
+
+# Collect all installed versioned kernel images grouped by variant.
+#
+# Standard naming:       linux-image-6.8.0-55-generic
+#   version -> 6.8.0-55
+#   variant -> generic
+#
+# PVE 7 naming:          pve-kernel-5.15.5-1-pve
+#   version -> 5.15.5-1
+#   variant -> pve
+#
+# PVE 8+ naming:         proxmox-kernel-6.8.12-4-pve
+#   version -> 6.8.12-4
+#   variant -> pve
+#
+# Signed variant:        proxmox-kernel-6.8.12-4-pve-signed
+#   (virtual package — satisfied by the real one; not queried directly)
+
+declare -A VARIANT_VERSIONS   # variant -> newline-separated sorted version list
+
+_collect_kernels() {
+    local pattern="$1"
+    local strip_prefix="$2"
+
+    while IFS= read -r pkg; do
+        # Strip any -signed suffix before parsing
+        pkg="${pkg%-signed}"
+        rest="${pkg#${strip_prefix}}"
+        variant="${rest##*-}"
+        version="${rest%-*}"
+        [[ -z "$version" || -z "$variant" ]] && continue
+        # Skip series metapackages e.g. pve-kernel-5.15 / proxmox-kernel-6.8
+        # (those have no patch-level component — only one or two dots)
+        [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]] && continue
+        VARIANT_VERSIONS[$variant]+="$version"$'\n'
+    done < <(dpkg-query -W -f='${Status} ${Package}\n' "$pattern" 2>/dev/null \
+             | awk '/^install ok installed/{print $4}')
+}
+
+# Standard Debian/Ubuntu kernels
+_collect_kernels 'linux-image-[0-9]*'      'linux-image-'
+
+# PVE 7 and older
+_collect_kernels 'pve-kernel-[0-9]*'       'pve-kernel-'
+
+# PVE 8+
+_collect_kernels 'proxmox-kernel-[0-9]*'   'proxmox-kernel-'
+
+# Deduplicate within each variant (a version may appear from both pve- and
+# proxmox- queries on a system mid-migration)
+for variant in "${!VARIANT_VERSIONS[@]}"; do
+    VARIANT_VERSIONS[$variant]=$(echo -n "${VARIANT_VERSIONS[$variant]}" | sort -uV)
+done
+
+PACKAGES_TO_REMOVE=()
+
+for variant in "${!VARIANT_VERSIONS[@]}"; do
+    mapfile -t sorted < <(echo -n "${VARIANT_VERSIONS[$variant]}" | sort -V)
+
+    count=${#sorted[@]}
+    [[ $count -eq 0 ]] && continue
+
+    newest="${sorted[$((count - 1))]}"
+
+    for ver in "${sorted[@]}"; do
+        [[ "$ver" == "$CURRENT_BASE" ]] && continue   # always keep running
+        [[ "$ver" == "$newest"       ]] && continue   # always keep newest (N-1)
+
+        # Standard kernel packages
+        for prefix in linux-image linux-headers linux-modules linux-modules-extra; do
+            pkg="${prefix}-${ver}-${variant}"
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok"; then
+                PACKAGES_TO_REMOVE+=("$pkg")
+            fi
+        done
+
+        # PVE 7 kernel packages
+        for prefix in pve-kernel pve-headers; do
+            pkg="${prefix}-${ver}-${variant}"
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok"; then
+                PACKAGES_TO_REMOVE+=("$pkg")
+            fi
+        done
+
+        # PVE 8+ kernel packages (including signed variant if present)
+        for prefix in proxmox-kernel proxmox-headers; do
+            for suffix in "" "-signed"; do
+                pkg="${prefix}-${ver}-${variant}${suffix}"
+                if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok"; then
+                    PACKAGES_TO_REMOVE+=("$pkg")
+                fi
+            done
+        done
+    done
+done
+
+# --- act ---
+
+if [[ ${#PACKAGES_TO_REMOVE[@]} -eq 0 ]]; then
+    info "Nothing to remove. System is already clean."
+    exit 0
 fi
 
-# store new list of metapackages currently installed
-dpkg -l | grep \ linux | grep ii | awk '{print $2}' | grep -v [0-9] > /tmp/$PID.packagelist.new
+info "Packages to remove:"
+for pkg in "${PACKAGES_TO_REMOVE[@]}"; do
+    info "  - $pkg"
+done
 
-# if they're different, reinstall the missing metapackages
-MISSING="`diff /tmp/$PID.packagelist.new /tmp/$PID.packagelist --left-column | cut -d' ' -f2 | grep linux`"
-if [ "$MISSING" != "" ]
-then
-  INSTALL=""
-  while read line
-  do
-    # make sure the package is actually missing first
-    if [ "`dpkg -l | grep -v ^ii | grep $line`" != "" ]
-    then
-      INSTALL="$INSTALL $line"
-    fi
-  done </tmp/$PID.packagelist
-  # if there are any missing packages, install them
-  if [ "$INSTALL" != "" ]
-  then
-    apt-get install -y $INSTALL
-  fi
+if $DRY_RUN; then
+    info "(dry-run) No changes made."
+    exit 0
 fi
 
-# clean up
-rm /tmp/$PID.*
+apt-get purge -y "${PACKAGES_TO_REMOVE[@]}"
+#apt-get autoremove -y --purge
+
+# --- metapackage restore ---
+
+METAPKG_AFTER="$TMPDIR_WORK/meta.after"
+dpkg-query -W -f='${Status} ${Package}\n' \
+        'linux-*' 'pve-kernel-*' 'pve-headers-*' \
+        'proxmox-kernel-*' 'proxmox-headers-*' \
+        'proxmox-default-kernel' 'proxmox-default-headers' \
+        2>/dev/null \
+    | awk '/^install ok installed/{print $4}' \
+    | grep -v '[0-9]' \
+    | sort > "$METAPKG_AFTER"
+
+mapfile -t MISSING_META < <(comm -23 "$METAPKG_BEFORE" "$METAPKG_AFTER")
+
+if [[ ${#MISSING_META[@]} -gt 0 ]]; then
+    warn "The following metapackages were removed as dependencies and will be reinstalled:"
+    for mp in "${MISSING_META[@]}"; do
+        warn "  + $mp"
+    done
+    apt-get install -y "${MISSING_META[@]}"
+fi
+
+info "Done."
